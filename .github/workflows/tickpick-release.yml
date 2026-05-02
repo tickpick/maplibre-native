@@ -1,0 +1,182 @@
+name: tickpick-release
+
+# Builds the iOS dynamic xcframework + Android opengl-release AAR from this
+# fork's combined-feature-state branch and publishes them to a GitHub Release
+# in this repository. Consumed by the TickPick mobile app via patch-package
+# overrides on `@maplibre/maplibre-react-native`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        type: string
+        default: ''
+        description: 'Optional release tag suffix. Default uses short SHA.'
+
+permissions:
+  contents: write
+
+jobs:
+  ios-build:
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: platform/ios
+        shell: bash
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Read iOS version
+        id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build XCFramework (Dynamic, Metal)
+        run: |
+          bazel build --compilation_mode=opt --features=dead_strip,thin_lto --objc_enable_binary_stripping \
+            --apple_generate_dsym --output_groups=+dsyms --//:renderer=metal //platform/ios:MapLibre.dynamic \
+            --embed_label=tickpick_maplibre_ios_${{ steps.version.outputs.version }}
+          echo xcframework="$(bazel info execution_root)"/"$(bazel cquery --output=files --compilation_mode=opt --//:renderer=metal //platform/ios:MapLibre.dynamic)" >> "$GITHUB_ENV"
+
+      - name: Package dSYMs
+        working-directory: ./bazel-bin/platform/ios/MapLibre.dynamic_dsyms
+        run: |
+          zip MapLibre_ios_device.framework.dSYM.zip \
+            MapLibre_ios_device.framework.dSYM/Contents/Resources/DWARF/MapLibre_ios_device \
+            MapLibre_ios_device.framework.dSYM/Contents/Info.plist
+          echo dsym_path="$(realpath MapLibre_ios_device.framework.dSYM.zip)" >> "$GITHUB_ENV"
+
+      - name: Stage xcframework + LICENSE
+        working-directory: .
+        run: |
+          cp "${{ env.xcframework }}" MapLibre.dynamic.xcframework.zip
+          chmod +w MapLibre.dynamic.xcframework.zip
+          zip MapLibre.dynamic.xcframework.zip LICENSE.md
+          cp "${{ env.dsym_path }}" .
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ios-artifacts
+          path: |
+            MapLibre.dynamic.xcframework.zip
+            MapLibre_ios_device.framework.dSYM.zip
+          if-no-files-found: error
+
+  android-build:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        working-directory: platform/android
+        shell: bash
+    env:
+      BUILDTYPE: Release
+      RENDERER: opengl
+      IS_LOCAL_DEVELOPMENT: false
+      MLN_ANDROID_STL: c++_static
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-android-ci
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v4
+        with:
+          node-version-file: ".nvmrc"
+
+      - name: npm install
+        run: npm ci --ignore-scripts
+        working-directory: .
+
+      - name: Generate Android style code
+        run: node platform/android/scripts/generate-style-code.mjs
+        working-directory: .
+
+      - name: Read Android version
+        id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Disable sccache S3 push (no AWS in fork)
+        run: |
+          echo SCCACHE_BUCKET=maplibre-native-sccache >> "$GITHUB_ENV"
+          echo SCCACHE_REGION=eu-central-1 >> "$GITHUB_ENV"
+          echo SCCACHE_S3_NO_CREDENTIALS=1 >> "$GITHUB_ENV"
+
+      - name: Build apackage (opengl, Release, all ABIs)
+        run: make apackage
+
+      - name: Stage release files
+        working-directory: .
+        run: |
+          mkdir -p release-staging
+          aar_src="platform/android/MapLibreAndroid/build/outputs/aar/MapLibreAndroid-opengl-release.aar"
+          if [ ! -f "$aar_src" ]; then
+            echo "::error::Expected AAR not found at $aar_src"
+            ls -la platform/android/MapLibreAndroid/build/outputs/aar/ || true
+            exit 1
+          fi
+          cp "$aar_src" release-staging/MapLibreAndroid-opengl-release.aar
+          # debug symbols tarball — name varies on opengl
+          for f in platform/android/build/debug-symbols-opengl-*.tar.gz; do
+            [ -e "$f" ] && cp "$f" release-staging/ || true
+          done
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: android-artifacts
+          path: release-staging/*
+          if-no-files-found: error
+
+  release:
+    needs: [ios-build, android-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          short_sha="${GITHUB_SHA:0:7}"
+          suffix="${{ github.event.inputs.tag_suffix }}"
+          if [ -n "$suffix" ]; then
+            tag="tickpick-feature-state-${suffix}"
+          else
+            tag="tickpick-feature-state-${short_sha}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          body: |
+            TickPick fork of MapLibre Native with feature-state APIs.
+
+            Combines:
+            - iOS: maplibre/maplibre-native#3858 (feature-state on MLNMapView)
+            - Android: maplibre/maplibre-native#4219 (feature-state on MapLibreMap / GeoJsonSource / VectorSource)
+
+            Upstream versions:
+            - iOS:     ${{ needs.ios-build.outputs.version }}
+            - Android: ${{ needs.android-build.outputs.version }}
+
+            Build SHA: `${{ github.sha }}`
+          files: |
+            dist/ios-artifacts/MapLibre.dynamic.xcframework.zip
+            dist/ios-artifacts/MapLibre_ios_device.framework.dSYM.zip
+            dist/android-artifacts/MapLibreAndroid-opengl-release.aar
+            dist/android-artifacts/debug-symbols-opengl-*.tar.gz
