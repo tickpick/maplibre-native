@@ -27,7 +27,33 @@ androidLibrary.publishing {
 afterEvaluate {
     mavenPublishing {
         publishToMavenCentral(true)
-        signAllPublications()
+        // Only sign publications when signing credentials are available. The
+        // tickpick fork publishes to GitHub Packages without signing; Maven
+        // Central still requires signing in the upstream release flow.
+        val hasSigningKey = !System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey").isNullOrBlank()
+            || !(project.findProperty("signingInMemoryKey") as String?).isNullOrBlank()
+        if (hasSigningKey) {
+            signAllPublications()
+        }
+    }
+}
+
+// Additional GitHub Packages target for the tickpick fork. Coexists with the
+// upstream Maven Central target — generates separate
+// publish<Pub>PublicationToGitHubPackagesRepository tasks.
+publishing {
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri(
+                System.getenv("MLN_GITHUB_PACKAGES_URL")
+                    ?: "https://maven.pkg.github.com/tickpick/maplibre-native"
+            )
+            credentials {
+                username = System.getenv("GITHUB_ACTOR") ?: ""
+                password = System.getenv("GITHUB_TOKEN") ?: ""
+            }
+        }
     }
 }
 

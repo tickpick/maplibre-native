@@ -1,26 +1,33 @@
 name: tickpick-release
 
 # Builds the iOS dynamic xcframework + Android opengl-release AAR from this
-# fork's combined-feature-state branch and publishes them to a GitHub Release
-# in this repository. Consumed by the TickPick mobile app via patch-package
-# overrides on `@maplibre/maplibre-react-native`.
+# fork's combined-feature-state branch and publishes them to:
+#  1. A GitHub Release in this repository (both platforms)
+#  2. GitHub Packages Maven repo at this repo (Android, for Gradle consumers)
+#  3. tickpick/maplibre-gl-native-distribution (iOS, via repository_dispatch)
+#
+# Consumed by the TickPick mobile app via:
+#  - ios/Podfile: $MLRN_NATIVE_VERSION + $MLRN_SPM_SPEC overrides
+#  - android/build.gradle: dependency substitution to our coordinate
 
 on:
   workflow_dispatch:
     inputs:
-      tag_suffix:
+      tickpick_revision:
         type: string
-        default: ''
-        description: 'Optional release tag suffix. Default uses short SHA.'
+        default: '1'
+        description: 'Rev counter (1, 2, ...). Final versions become <upstream>-tickpick.<rev>.'
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   ios-build:
     runs-on: macos-14
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      upstream_version: ${{ steps.version.outputs.upstream }}
+      tickpick_version: ${{ steps.version.outputs.tickpick }}
     defaults:
       run:
         working-directory: platform/ios
@@ -31,15 +38,20 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Read iOS version
+      - name: Compute iOS versions
         id: version
-        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+        run: |
+          upstream=$(cat VERSION)
+          tickpick="${upstream}-tickpick.${{ github.event.inputs.tickpick_revision }}"
+          echo "upstream=${upstream}" >> "$GITHUB_OUTPUT"
+          echo "tickpick=${tickpick}" >> "$GITHUB_OUTPUT"
+          echo "::notice::iOS upstream=${upstream}, tickpick=${tickpick}"
 
       - name: Build XCFramework (Dynamic, Metal)
         run: |
           bazel build --compilation_mode=opt --features=dead_strip,thin_lto --objc_enable_binary_stripping \
             --apple_generate_dsym --output_groups=+dsyms --//:renderer=metal //platform/ios:MapLibre.dynamic \
-            --embed_label=tickpick_maplibre_ios_${{ steps.version.outputs.version }}
+            --embed_label=tickpick_maplibre_ios_${{ steps.version.outputs.tickpick }}
           echo xcframework="$(bazel info execution_root)"/"$(bazel cquery --output=files --compilation_mode=opt --//:renderer=metal //platform/ios:MapLibre.dynamic)" >> "$GITHUB_ENV"
 
       - name: Package dSYMs
@@ -69,7 +81,8 @@ jobs:
   android-build:
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      upstream_version: ${{ steps.version.outputs.upstream }}
+      tickpick_version: ${{ steps.version.outputs.tickpick }}
     defaults:
       run:
         working-directory: platform/android
@@ -99,9 +112,14 @@ jobs:
         run: node platform/android/scripts/generate-style-code.mjs
         working-directory: .
 
-      - name: Read Android version
+      - name: Compute Android versions
         id: version
-        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+        run: |
+          upstream=$(cat VERSION)
+          tickpick="${upstream}-tickpick.${{ github.event.inputs.tickpick_revision }}"
+          echo "upstream=${upstream}" >> "$GITHUB_OUTPUT"
+          echo "tickpick=${tickpick}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Android upstream=${upstream}, tickpick=${tickpick}"
 
       - name: Disable sccache S3 push (no AWS in fork)
         run: |
@@ -109,8 +127,23 @@ jobs:
           echo SCCACHE_REGION=eu-central-1 >> "$GITHUB_ENV"
           echo SCCACHE_S3_NO_CREDENTIALS=1 >> "$GITHUB_ENV"
 
+      - name: Set Gradle version override
+        run: |
+          # ORG_GRADLE_PROJECT_<name> is read by Gradle as project property
+          # `<name>`. maplibre.artifact-settings.gradle.kts honors
+          # `mapLibreVersionOverride` to set the artifact version, used as
+          # the Maven version on GitHub Packages.
+          echo "ORG_GRADLE_PROJECT_mapLibreVersionOverride=${{ steps.version.outputs.tickpick }}" >> "$GITHUB_ENV"
+
       - name: Build apackage (opengl, Release, all ABIs)
         run: make apackage
+
+      - name: Publish AAR to GitHub Packages
+        run: |
+          ./gradlew :MapLibreAndroid:publishOpenglreleasePublicationToGitHubPackagesRepository --info --no-daemon
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Stage release files
         working-directory: .
@@ -123,7 +156,6 @@ jobs:
             exit 1
           fi
           cp "$aar_src" release-staging/MapLibreAndroid-opengl-release.aar
-          # debug symbols tarball — name varies on opengl
           for f in platform/android/build/debug-symbols-opengl-*.tar.gz; do
             [ -e "$f" ] && cp "$f" release-staging/ || true
           done
@@ -137,6 +169,8 @@ jobs:
   release:
     needs: [ios-build, android-build]
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
 
@@ -147,13 +181,12 @@ jobs:
       - name: Compute release tag
         id: tag
         run: |
-          short_sha="${GITHUB_SHA:0:7}"
-          suffix="${{ github.event.inputs.tag_suffix }}"
-          if [ -n "$suffix" ]; then
-            tag="tickpick-feature-state-${suffix}"
-          else
-            tag="tickpick-feature-state-${short_sha}"
-          fi
+          # Tag includes both platform versions for traceability. Most
+          # consumers pin against the SPM tag (iOS) or Maven coordinate
+          # (Android), not the maplibre-native release tag itself, but
+          # we keep a stable string here as the source-of-truth artifact
+          # location.
+          tag="tickpick-${{ needs.ios-build.outputs.tickpick_version }}-android-${{ needs.android-build.outputs.tickpick_version }}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
@@ -167,12 +200,12 @@ jobs:
             TickPick fork of MapLibre Native with feature-state APIs.
 
             Combines:
-            - iOS: maplibre/maplibre-native#3858 (feature-state on MLNMapView)
-            - Android: maplibre/maplibre-native#4219 (feature-state on MapLibreMap / GeoJsonSource / VectorSource)
+            - iOS:     maplibre/maplibre-native#3858 (feature-state on `MLNMapView`)
+            - Android: maplibre/maplibre-native#4219 (feature-state on GeoJsonSource / VectorSource)
 
-            Upstream versions:
-            - iOS:     ${{ needs.ios-build.outputs.version }}
-            - Android: ${{ needs.android-build.outputs.version }}
+            Distributable versions:
+            - iOS SPM:        `${{ needs.ios-build.outputs.tickpick_version }}` via tickpick/maplibre-gl-native-distribution
+            - Android Maven:  `org.maplibre.gl:android-sdk-opengl:${{ needs.android-build.outputs.tickpick_version }}` via GitHub Packages
 
             Build SHA: `${{ github.sha }}`
           files: |
@@ -180,3 +213,41 @@ jobs:
             dist/ios-artifacts/MapLibre_ios_device.framework.dSYM.zip
             dist/android-artifacts/MapLibreAndroid-opengl-release.aar
             dist/android-artifacts/debug-symbols-opengl-*.tar.gz
+
+      - name: Dispatch SPM update (auto, if PAT available)
+        # Cross-repo dispatch needs a PAT — the default GITHUB_TOKEN only has
+        # access to this repo. If TICKPICK_BOT_PAT is unset, this step skips
+        # cleanly; trigger update-spm.yml manually in that case.
+        env:
+          TICKPICK_BOT_PAT: ${{ secrets.TICKPICK_BOT_PAT }}
+        run: |
+          if [ -z "$TICKPICK_BOT_PAT" ]; then
+            cat <<EOF
+            ::warning::secrets.TICKPICK_BOT_PAT is unset. Skipping auto-dispatch
+            of update-spm.yml in tickpick/maplibre-gl-native-distribution.
+
+            Trigger manually:
+              gh workflow run update-spm.yml \\
+                --repo tickpick/maplibre-gl-native-distribution \\
+                -f release_tag='${{ steps.tag.outputs.tag }}' \\
+                -f version='${{ needs.ios-build.outputs.tickpick_version }}'
+          EOF
+            exit 0
+          fi
+          curl -fL --retry 3 \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TICKPICK_BOT_PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/tickpick/maplibre-gl-native-distribution/dispatches \
+            -d "$(cat <<EOF
+          {
+            "event_type": "maplibre-native-released",
+            "client_payload": {
+              "release_tag": "${{ steps.tag.outputs.tag }}",
+              "version": "${{ needs.ios-build.outputs.tickpick_version }}"
+            }
+          }
+          EOF
+          )"
+          echo "::notice::Dispatched maplibre-native-released to update-spm.yml"
